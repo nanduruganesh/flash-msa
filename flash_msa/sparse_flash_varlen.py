@@ -25,7 +25,20 @@ from flash_msa.reverse_index_cuda import (
 
 BLOCK_SIZE = 128
 TASKS_PER_FLASH_CHUNK = int(os.environ.get("MSA_FLASH_TASKS_PER_CHUNK", "256"))
-LSE_VALUE_DIM = 8
+
+# Had to write this section to set the narrow V head for Proxy LSE varlen flash call
+# to the minimum dim supported on each backend. FA4 on B200 fails with V_dim=8
+LSE_VALUE_DIM_H100 = 8
+LSE_VALUE_DIM_B200 = 16
+def _lse_value_dim(device: torch.device) -> int:
+    instruction_set = torch.cuda.get_device_capability(device)
+    if instruction_set[0] == 9:
+        return LSE_VALUE_DIM_H100
+    if instruction_set[0] == 10:
+        return LSE_VALUE_DIM_B200
+    raise NotImplementedError(
+        f"Proxy LSE dummy V is not configured for SM{instruction_set[0]}{instruction_set[1]}"
+    )
 
 
 def _local_block_attention(
@@ -113,13 +126,15 @@ def sparse_flash_varlen_forward(
 
     main_per_proxy = n_heads // n_proxy_heads
 
-    # FA4 accepts a narrow dummy V for LSE-only proxy attention, shrinking the
-    # ignored output 16x.  FA3 requires a full-width V when Q/K have D=128.
+    # FA4 accepts a narrow dummy V for LSE-only proxy attention. SM100 requires
+    # 16 elements because its packed-GQA epilogue rejects an 8-element V.
     if return_output or not flash_attn_supports_narrow_value_dim():
         attention_v = v
     else:
         attention_v = torch.zeros(
-            (*v.shape[:-1], LSE_VALUE_DIM), device=v.device, dtype=v.dtype
+            (*v.shape[:-1], _lse_value_dim(v.device)),
+            device=v.device,
+            dtype=v.dtype,
         )
     local_out, local_lse_hs = _local_block_attention(
         q, k, attention_v, scale=float(scale)
