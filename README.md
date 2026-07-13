@@ -46,7 +46,7 @@ Note that kl_loss in the forward is just a torch.zeros placeholder, but after ad
 
 # Caveats
 
-1. No varlen/doc-masking support yet (highest priority)
+1. Pending varlen/doc-masking support ([WIP branch](https://github.com/nanduruganesh/flash-msa/tree/doc-masking))
 2. Flash-MSA only supports headdims 128, block size 128.
 3. Flash-MSA does not currently return fully materialized KL div. loss term in the fwd/bwd (see [blog](https://nanduruganesh.github.io/flash-msa) for explanation).
 4. No support for quantized training (fp8, nvfp4, mxfp4).
