@@ -9,7 +9,10 @@ from flash_msa.msa_select_cutedsl import compute_proxy_lse, select_blocks
 from flash_msa.msa_backward_cutedsl import run_fused_backward
 from flash_msa.msa_forward_cutedsl import run_main_forward
 from flash_msa.reverse_index_cuda import (
+    DocumentSegmentMetadata,
     SparseAttentionMetadata,
+    build_document_segment_metadata,
+    build_document_segment_metadata_from_cu_seqlens,
     build_sparse_attention_metadata_cuda,
 )
 
@@ -118,6 +121,7 @@ def _run_fused_selected_edge_backward(
         metadata.task_qids,
         scale=float(scale),
         grad_kl_scale=proxy_grad_scale,
+        document_segments=metadata.document_segments,
     )
     if grad_kl is not None:
         proxy_multiplier = grad_kl.detach().to(device=q.device, dtype=dq_proxy.dtype)
@@ -137,17 +141,40 @@ class _SparseAttentionFunction(torch.autograd.Function):
         v: torch.Tensor,
         top_k: int,
         scale: float,
+        document_list: torch.Tensor | None,
+        cu_seqlens: torch.Tensor | None,
     ):
         b, n_proxy_heads, s, head_dim = q_proxy.shape
         n_heads = q.shape[1]
         n_kv_heads = k.shape[1]
         num_blocks, top_k_blocks = _validate_inputs(q_proxy, k_proxy, q, k, v, int(top_k))
+        if document_list is not None and cu_seqlens is not None:
+            raise ValueError("document_list and cu_seqlens are mutually exclusive")
+
+        document_segments = None
+        if document_list is not None:
+            if document_list.shape != (b, s):
+                raise ValueError(
+                    f"document_list must have shape {(b, s)}, got {tuple(document_list.shape)}"
+                )
+            if document_list.device != q_proxy.device:
+                raise ValueError("document_list must be on the same device as attention inputs")
+            document_segments = build_document_segment_metadata(document_list)
+        elif cu_seqlens is not None:
+            if cu_seqlens.device != q_proxy.device:
+                raise ValueError("cu_seqlens must be on the same device as attention inputs")
+            document_segments = build_document_segment_metadata_from_cu_seqlens(
+                cu_seqlens,
+                batch_size=b,
+                seq_len=s,
+            )
         block_indices = select_blocks(
             q_proxy,
             k_proxy,
             scale=float(scale),
             num_blocks=num_blocks,
             top_k_blocks=top_k_blocks,
+            document_segments=document_segments,
         )
 
         main_per_proxy = int(n_heads) // int(n_proxy_heads)
@@ -159,6 +186,7 @@ class _SparseAttentionFunction(torch.autograd.Function):
         metadata = build_sparse_attention_metadata_cuda(
             block_indices,
             backward_query_chunk=NATIVE_MMA_ROWS_PER_TASK // main_per_proxy,
+            document_segments=document_segments,
         )
 
         o_main, lse_main, kl_loss = run_main_forward(
@@ -171,7 +199,7 @@ class _SparseAttentionFunction(torch.autograd.Function):
 
         out = o_main.transpose(1, 2).reshape(b, s, -1)
 
-        save_tensors = (
+        save_tensors: tuple[torch.Tensor, ...] = (
             q_proxy,
             k_proxy,
             q,
@@ -187,7 +215,22 @@ class _SparseAttentionFunction(torch.autograd.Function):
             metadata.destinations,
             metadata.edge_positions,
         )
+        if document_segments is not None:
+            save_tensors += (
+                document_segments.starts,
+                document_segments.lengths,
+                document_segments.batches,
+                document_segments.doc_first_segment,
+                document_segments.token_segment_ids,
+                document_segments.cu_seqlens,
+            )
         ctx.save_for_backward(*save_tensors)
+        ctx.has_document_segments = document_segments is not None
+        ctx.full_segments_cpu = (
+            None
+            if document_segments is None
+            else document_segments.full_segments_cpu
+        )
         ctx.scale = float(scale)
         ctx.num_remote_tasks = metadata.num_remote_tasks
         ctx.remote_task_meta_cpu = metadata.remote_task_meta_cpu
@@ -202,6 +245,7 @@ class _SparseAttentionFunction(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_out: torch.Tensor | None, grad_kl: torch.Tensor | None):
+        base_tensors = ctx.saved_tensors[:14]
         (
             q_proxy,
             k_proxy,
@@ -217,7 +261,26 @@ class _SparseAttentionFunction(torch.autograd.Function):
             packed_qids,
             destinations,
             edge_positions,
-        ) = ctx.saved_tensors
+        ) = base_tensors
+        document_segments = None
+        if ctx.has_document_segments:
+            (
+                segment_starts,
+                segment_lengths,
+                segment_batches,
+                doc_first_segment,
+                token_segment_ids,
+                segment_cu_seqlens,
+            ) = ctx.saved_tensors[14:]
+            document_segments = DocumentSegmentMetadata(
+                starts=segment_starts,
+                lengths=segment_lengths,
+                batches=segment_batches,
+                doc_first_segment=doc_first_segment,
+                token_segment_ids=token_segment_ids,
+                cu_seqlens=segment_cu_seqlens,
+                full_segments_cpu=ctx.full_segments_cpu,
+            )
         batch, n_proxy_heads, seq_len, top_k_blocks, remote_query_chunk = (
             ctx.metadata_shape
         )
@@ -236,6 +299,7 @@ class _SparseAttentionFunction(torch.autograd.Function):
             seq_len=seq_len,
             top_k_blocks=top_k_blocks,
             remote_query_chunk=remote_query_chunk,
+            document_segments=document_segments,
         )
 
         if grad_out is None:
@@ -259,7 +323,7 @@ class _SparseAttentionFunction(torch.autograd.Function):
             metadata,
             scale=ctx.scale,
         )
-        return dq_proxy, dk_proxy, dq, dk, dv, None, None
+        return dq_proxy, dk_proxy, dq, dk, dv, None, None, None, None
 
 
 def sparse_attention(
@@ -270,9 +334,27 @@ def sparse_attention(
     v: torch.Tensor,
     top_k: int,
     scale: float,
+    document_list: torch.Tensor | None = None,
+    *,
+    cu_seqlens: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return ``(attn_out, kl_loss placeholder)`` for sparse self-attention.
+
+    ``cu_seqlens`` follows FA4's CUDA int32 cumulative-offset convention and
+    indexes the flattened ``B * S`` token dimension. It is mutually exclusive
+    with ``document_list``. Flash-MSA still expects Q/K/V tensors in ``B,H,S,D``
+    layout, so the offsets must include every batch-row boundary. Q/K are
+    already projected inputs; callers remain responsible for resetting RoPE at
+    each cumulative document boundary.
     """
-    Return (attn_out, kl_loss placeholder)
-    Saves reverse-index metadata and main attention state for backward.
-    """
-    return _SparseAttentionFunction.apply(q_proxy, k_proxy, q, k, v, int(top_k), float(scale))
+    return _SparseAttentionFunction.apply(
+        q_proxy,
+        k_proxy,
+        q,
+        k,
+        v,
+        int(top_k),
+        float(scale),
+        document_list,
+        cu_seqlens,
+    )

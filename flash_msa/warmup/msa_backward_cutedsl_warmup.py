@@ -8,8 +8,11 @@ backward before launching the tiled gradient kernel.
 
 import torch
 
+from flash_msa.reverse_index_cuda import DocumentSegmentMetadata
+
 BLOCK_SIZE = 128
 _SCHEDULE_CACHE: dict[tuple[int, int, int, int, int, int], tuple[torch.Tensor, torch.Tensor]] = {}
+_DOCUMENT_SCHEDULE_CACHE: dict[tuple, tuple[torch.Tensor, torch.Tensor]] = {}
 
 
 def _device_index(device: torch.device) -> int:
@@ -64,6 +67,74 @@ def _dense_causal_schedule(
     return task_meta, task_qids
 
 
+def _dense_document_schedule(
+    *,
+    n_proxy_heads: int,
+    seq_len: int,
+    query_chunk: int,
+    cu_seqlens: torch.Tensor,
+    document_segments: DocumentSegmentMetadata,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return reverse-index tasks for all causal edges within each document."""
+
+    offsets = tuple(int(value) for value in cu_seqlens.detach().cpu().tolist())
+    key = (
+        _device_index(device),
+        int(n_proxy_heads),
+        int(seq_len),
+        int(query_chunk),
+        offsets,
+    )
+    if key in _DOCUMENT_SCHEDULE_CACHE:
+        return _DOCUMENT_SCHEDULE_CACHE[key]
+
+    starts = document_segments.starts.detach().cpu().tolist()
+    lengths = document_segments.lengths.detach().cpu().tolist()
+    batches = document_segments.batches.detach().cpu().tolist()
+    doc_first = document_segments.doc_first_segment.detach().cpu().tolist()
+    first_segments = [
+        segment_idx
+        for segment_idx, first_segment in enumerate(doc_first)
+        if segment_idx == first_segment
+    ]
+
+    meta_rows: list[list[int]] = []
+    qid_rows: list[torch.Tensor] = []
+    for proxy_head in range(int(n_proxy_heads)):
+        for document_idx, first_segment in enumerate(first_segments):
+            next_first_segment = (
+                first_segments[document_idx + 1]
+                if document_idx + 1 < len(first_segments)
+                else len(starts)
+            )
+            last_segment = next_first_segment - 1
+            document_end = int(starts[last_segment]) + int(lengths[last_segment])
+            batch_idx = int(batches[first_segment])
+            for key_segment in range(first_segment, next_first_segment):
+                qids = torch.arange(
+                    int(starts[key_segment]), document_end, dtype=torch.int32
+                )
+                for start in range(0, int(qids.numel()), int(query_chunk)):
+                    chunk = qids[start : start + int(query_chunk)]
+                    valid = int(chunk.numel())
+                    qid_row = torch.full(
+                        (int(query_chunk),), -1, dtype=torch.int32
+                    )
+                    qid_row[:valid] = chunk
+                    meta_rows.append(
+                        [batch_idx, proxy_head, key_segment, valid]
+                    )
+                    qid_rows.append(qid_row)
+
+    task_meta = torch.tensor(meta_rows, dtype=torch.int32, device=device)
+    task_qids = torch.stack(qid_rows, dim=0).to(
+        device=device, non_blocking=True
+    )
+    _DOCUMENT_SCHEDULE_CACHE[key] = (task_meta, task_qids)
+    return task_meta, task_qids
+
+
 def _lse_from_flash(
     lse: torch.Tensor,
     *,
@@ -85,6 +156,7 @@ def _run_proxy_lse_flash(
     k_proxy: torch.Tensor,
     *,
     scale: float,
+    cu_seqlens: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Compute dense causal proxy LSE for the KL-gradient branch."""
 
@@ -98,7 +170,15 @@ def _run_proxy_lse_flash(
     k_pack = k_proxy.transpose(1, 2).contiguous().view(
         batch * seq_len, n_proxy_kv_heads, head_dim
     )
-    cu_seqlens = torch.arange(batch + 1, device=q_proxy.device, dtype=torch.int32) * int(seq_len)
+    if cu_seqlens is None:
+        cu_seqlens = (
+            torch.arange(batch + 1, device=q_proxy.device, dtype=torch.int32)
+            * int(seq_len)
+        )
+        max_seqlen = int(seq_len)
+    else:
+        cu_seqlens = cu_seqlens.detach().contiguous()
+        max_seqlen = int((cu_seqlens[1:] - cu_seqlens[:-1]).max().cpu())
 
     _out, lse = flash_attn_varlen_forward(
         q=q_pack,
@@ -106,8 +186,8 @@ def _run_proxy_lse_flash(
         v=k_pack,
         cu_seqlens_q=cu_seqlens,
         cu_seqlens_k=cu_seqlens,
-        max_seqlen_q=int(seq_len),
-        max_seqlen_k=int(seq_len),
+        max_seqlen_q=max_seqlen,
+        max_seqlen_k=max_seqlen,
         softmax_scale=float(scale),
         causal=True,
     )
@@ -126,6 +206,8 @@ def run_warmup_backward(
     grad_kl: torch.Tensor | None,
     *,
     scale: float,
+    cu_seqlens: torch.Tensor | None = None,
+    document_segments: DocumentSegmentMetadata | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Run tiled CuTeDSL backward over the full causal block schedule."""
 
@@ -159,14 +241,31 @@ def run_warmup_backward(
     _main_per_proxy, query_chunk, _rows_per_task, _proxy_query_rows = _derive_head_tiling(
         n_heads, n_kv_heads, n_proxy_heads
     )
-    task_meta, task_qids = _dense_causal_schedule(
-        batch=batch,
-        n_proxy_heads=n_proxy_heads,
-        seq_len=seq_len,
-        query_chunk=query_chunk,
-        device=q.device,
+    if document_segments is None:
+        task_meta, task_qids = _dense_causal_schedule(
+            batch=batch,
+            n_proxy_heads=n_proxy_heads,
+            seq_len=seq_len,
+            query_chunk=query_chunk,
+            device=q.device,
+        )
+    else:
+        if cu_seqlens is None:
+            raise ValueError("document_segments requires cu_seqlens")
+        task_meta, task_qids = _dense_document_schedule(
+            n_proxy_heads=n_proxy_heads,
+            seq_len=seq_len,
+            query_chunk=query_chunk,
+            cu_seqlens=cu_seqlens,
+            document_segments=document_segments,
+            device=q.device,
+        )
+    lse_proxy = _run_proxy_lse_flash(
+        q_proxy,
+        k_proxy,
+        scale=float(scale),
+        cu_seqlens=cu_seqlens,
     )
-    lse_proxy = _run_proxy_lse_flash(q_proxy, k_proxy, scale=float(scale))
     delta_main = (o_main.float() * grad_o_main.float()).sum(dim=-1)
 
     dq_proxy, dk_proxy, dq, dk, dv = run_fused_backward(
@@ -183,6 +282,7 @@ def run_warmup_backward(
         task_qids,
         scale=float(scale),
         grad_kl_scale=proxy_grad_scale,
+        document_segments=document_segments,
     )
     if grad_kl is not None:
         proxy_multiplier = grad_kl.detach().to(device=q.device, dtype=dq_proxy.dtype)

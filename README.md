@@ -36,6 +36,20 @@ uv pip install -e . --no-build-isolation
 from flash_msa import flash_msa_func
 attn_out, kl_loss = flash_msa_func(Q_proxy, K_proxy, Q, K, V, top_k, head_dim ** -0.5)
 ```
+For packed-document self-attention, pass FA4-style cumulative document offsets:
+```
+attn_out, kl_loss = flash_msa_func(
+    Q_proxy, K_proxy, Q, K, V, top_k, head_dim ** -0.5,
+    cu_seqlens=cu_seqlens,
+)
+```
+`cu_seqlens` must be a one-dimensional CUDA `int32` tensor over flattened `B * S`
+tokens and contain every batch-row boundary. The legacy `[B, S]` `document_list`
+argument remains supported; the two formats are mutually exclusive. Flash-MSA
+accepts already projected Q/K tensors, so RoPE positions must be reset at each
+document boundary before calling it. `flash_msa_warmup_func` accepts the same
+`cu_seqlens` keyword for document-masked dense warmup.
+
 or
 ```
 from flash_msa import flash_msa_warmup_func

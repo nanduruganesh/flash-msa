@@ -25,6 +25,7 @@ def run_main_forward(
     v: torch.Tensor,
     *,
     scale: float,
+    cu_seqlens: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Run dense causal main attention and return ``(O_main, LSE_main, kl_loss)``."""
 
@@ -47,7 +48,15 @@ def run_main_forward(
     q_pack = q.transpose(1, 2).contiguous().view(batch * seq_len, n_heads, head_dim)
     k_pack = k.transpose(1, 2).contiguous().view(batch * seq_len, n_kv_heads, head_dim)
     v_pack = v.transpose(1, 2).contiguous().view(batch * seq_len, n_kv_heads, head_dim)
-    cu_seqlens = torch.arange(batch + 1, device=q.device, dtype=torch.int32) * int(seq_len)
+    if cu_seqlens is None:
+        cu_seqlens = (
+            torch.arange(batch + 1, device=q.device, dtype=torch.int32)
+            * int(seq_len)
+        )
+        max_seqlen = int(seq_len)
+    else:
+        cu_seqlens = cu_seqlens.detach().contiguous()
+        max_seqlen = int((cu_seqlens[1:] - cu_seqlens[:-1]).max().cpu())
 
     out, lse = flash_attn_varlen_forward(
         q=q_pack,
@@ -55,8 +64,8 @@ def run_main_forward(
         v=v_pack,
         cu_seqlens_q=cu_seqlens,
         cu_seqlens_k=cu_seqlens,
-        max_seqlen_q=int(seq_len),
-        max_seqlen_k=int(seq_len),
+        max_seqlen_q=max_seqlen,
+        max_seqlen_k=max_seqlen,
         softmax_scale=float(scale),
         causal=True,
     )

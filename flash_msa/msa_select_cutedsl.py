@@ -8,6 +8,7 @@ materializing either the full ``S x S`` score matrix or the compact
 """
 
 import math
+from typing import Optional
 
 import cutlass
 import torch
@@ -16,7 +17,7 @@ from cutlass import Int32, cute
 from cutlass.cute.nvgpu import cpasync, warp
 from cutlass.cute.runtime import from_dlpack
 
-from flash_msa.reverse_index_cuda import SparseAttentionMetadata
+from flash_msa.reverse_index_cuda import DocumentSegmentMetadata, SparseAttentionMetadata
 
 BLOCK_SIZE = 128
 SELECT_M = 128
@@ -39,6 +40,7 @@ class _MSASelectBlocksKernel:
         seq_len: int,
         top_k_blocks: int,
         head_dim: int,
+        num_segments: int | None = None,
         num_threads: int = 128,
     ) -> None:
         if head_dim != 128:
@@ -53,6 +55,9 @@ class _MSASelectBlocksKernel:
         self.proxy_groups = int(n_proxy_heads) // int(n_proxy_kv_heads)
         self.seq_len = int(seq_len)
         self.num_blocks = int(seq_len) // BLOCK_SIZE
+        self.use_document_segments = num_segments is not None
+        self.num_segments = 0 if num_segments is None else int(num_segments)
+        self.num_key_units = self.num_segments if self.use_document_segments else self.num_blocks
         self.num_query_tiles = (int(seq_len) + SELECT_M - 1) // SELECT_M
         self.top_k_blocks = int(top_k_blocks)
         self.head_dim = int(head_dim)
@@ -66,6 +71,10 @@ class _MSASelectBlocksKernel:
         q_proxy: cute.Tensor,
         k_proxy: cute.Tensor,
         block_indices: cute.Tensor,
+        segment_starts: Optional[cute.Tensor],
+        segment_lengths: Optional[cute.Tensor],
+        segment_batches: Optional[cute.Tensor],
+        doc_first_segment: Optional[cute.Tensor],
         softmax_scale: cutlass.Float32,
         stream: cuda.CUstream,
     ):
@@ -134,6 +143,10 @@ class _MSASelectBlocksKernel:
             q_proxy,
             k_proxy,
             block_indices,
+            segment_starts,
+            segment_lengths,
+            segment_batches,
+            doc_first_segment,
             softmax_scale_log2,
             sQ_layout,
             sK_layout,
@@ -141,7 +154,11 @@ class _MSASelectBlocksKernel:
             tiled_mma,
             SharedStorage,
         ).launch(
-            grid=[self.num_query_tiles, self.n_proxy_heads, self.batch],
+            grid=[
+                self.num_segments if self.use_document_segments else self.num_query_tiles,
+                self.n_proxy_heads,
+                1 if self.use_document_segments else self.batch,
+            ],
             block=[self.num_threads, 1, 1],
             stream=stream,
         )
@@ -152,6 +169,10 @@ class _MSASelectBlocksKernel:
         q_proxy: cute.Tensor,
         k_proxy: cute.Tensor,
         block_indices: cute.Tensor,
+        segment_starts: Optional[cute.Tensor],
+        segment_lengths: Optional[cute.Tensor],
+        segment_batches: Optional[cute.Tensor],
+        doc_first_segment: Optional[cute.Tensor],
         softmax_scale_log2: cutlass.Float32,
         sQ_layout: cute.ComposedLayout,
         sK_layout: cute.ComposedLayout,
@@ -163,6 +184,16 @@ class _MSASelectBlocksKernel:
         query_tile, proxy_head, batch = cute.arch.block_idx()
         query_start = query_tile * Int32(SELECT_M)
         query_count = cutlass.min(Int32(SELECT_M), Int32(self.seq_len) - query_start)
+        key_unit_begin = Int32(0)
+        key_unit_end = query_start // Int32(BLOCK_SIZE) + Int32(1)
+        local_key_unit = query_start // Int32(BLOCK_SIZE)
+        if cutlass.const_expr(self.use_document_segments):
+            batch = segment_batches[query_tile]
+            query_start = segment_starts[query_tile]
+            query_count = segment_lengths[query_tile]
+            key_unit_begin = doc_first_segment[query_tile]
+            key_unit_end = query_tile + Int32(1)
+            local_key_unit = query_tile
         proxy_kv_head = proxy_head // Int32(self.proxy_groups)
 
         smem = cutlass.utils.SmemAllocator()
@@ -207,6 +238,9 @@ class _MSASelectBlocksKernel:
         tSrK_copy_view = smem_thr_copy_K.retile(tSrK)
         gmem_thr_copy = gmem_tiled_copy.get_slice(tidx)
         tKsK_gmem = gmem_thr_copy.partition_D(sK)
+        cK = cute.make_identity_tensor((KEY_SLICE_SIZE, self.head_dim))
+        tKcK = gmem_thr_copy.partition_S(cK)
+        t0KcK = gmem_tiled_copy.get_slice(0).partition_S(cK)
 
         cS = cute.make_identity_tensor((self.rows_per_task, KEY_SLICE_SIZE))
         tScS = thr_mma.partition_C(cS)
@@ -222,7 +256,7 @@ class _MSASelectBlocksKernel:
                 # Empty top-k slots must use an out-of-range sentinel.  Seeding
                 # them with real block IDs creates duplicates when those blocks
                 # are subsequently inserted with their computed scores.
-                top_idx[rr, slot] = Int32(self.num_blocks)
+                top_idx[rr, slot] = Int32(self.num_key_units)
 
         cute.copy(
             smem_tiled_copy_Q,
@@ -233,35 +267,76 @@ class _MSASelectBlocksKernel:
         # SELECT_M == BLOCK_SIZE, so every valid query in this CTA belongs to
         # the same causal block.  Future blocks can never enter the selected
         # attention set; leave their top-k slots at the out-of-range sentinel.
-        key_block_end = query_start // Int32(BLOCK_SIZE) + Int32(1)
-        key_block = Int32(0)
-        while key_block < key_block_end:
+        key_unit = key_unit_begin
+        while key_unit < key_unit_end:
             block_max = cute.make_rmem_tensor((num_acc_rows,), cutlass.Float32)
             block_max.fill(-cutlass.Float32.inf)
 
+            key_start = key_unit * Int32(BLOCK_SIZE)
+            key_count = Int32(BLOCK_SIZE)
+            if cutlass.const_expr(self.use_document_segments):
+                key_start = segment_starts[key_unit]
+                key_count = segment_lengths[key_unit]
+
             for key_slice in cutlass.range_constexpr(KEY_SLICES):
-                key_tile = key_block * Int32(KEY_SLICES) + Int32(key_slice)
-                gK = cute.local_tile(
-                    k_proxy[batch, proxy_kv_head, None, None],
-                    (KEY_SLICE_SIZE, self.head_dim),
-                    (key_tile, 0),
-                )
-                # The dynamic causal loop bound currently makes CuTe lose the
-                # statically valid 16-byte alignment of this tile offset.
-                # Every tile starts at 64 * D bf16 elements, so reassert it.
-                gK = cute.make_tensor(
-                    cute.make_ptr(
-                        self._dtype,
-                        gK.iterator.llvm_ptr,
-                        gK.iterator.memspace,
-                        assumed_align=16,
-                    ),
-                    gK.layout,
-                )
-                tKgK = gmem_thr_copy.partition_S(gK)
-                cute.copy(gmem_tiled_copy, tKgK, tKsK_gmem)
-                cute.arch.cp_async_commit_group()
-                cute.arch.cp_async_wait_group(0)
+                if cutlass.const_expr(self.use_document_segments):
+                    mK = cute.domain_offset(
+                        (key_start + Int32(key_slice * KEY_SLICE_SIZE), 0),
+                        k_proxy[batch, proxy_kv_head, None, None],
+                    )
+                    gK = cute.local_tile(
+                        mK,
+                        (KEY_SLICE_SIZE, self.head_dim),
+                        (0, 0),
+                    )
+                    gK = cute.make_tensor(
+                        cute.make_ptr(
+                            self._dtype,
+                            gK.iterator.llvm_ptr,
+                            gK.iterator.memspace,
+                            assumed_align=16,
+                        ),
+                        gK.layout,
+                    )
+                    tKgK = gmem_thr_copy.partition_S(gK)
+                    row_limit = (
+                        key_count
+                        - Int32(key_slice * KEY_SLICE_SIZE)
+                        - tKcK[0][0]
+                    )
+                    for copy_row in cutlass.range_constexpr(
+                        cute.size(tKsK_gmem.shape[1])
+                    ):
+                        if t0KcK[0, copy_row, 0][0] < row_limit:
+                            cute.copy(
+                                gmem_tiled_copy,
+                                tKgK[None, copy_row, None],
+                                tKsK_gmem[None, copy_row, None],
+                            )
+                    cute.arch.cp_async_commit_group()
+                    cute.arch.cp_async_wait_group(0)
+                else:
+                    key_tile = key_unit * Int32(KEY_SLICES) + Int32(key_slice)
+                    gK = cute.local_tile(
+                        k_proxy[batch, proxy_kv_head, None, None],
+                        (KEY_SLICE_SIZE, self.head_dim),
+                        (key_tile, 0),
+                    )
+                    # The dynamic causal loop bound currently makes CuTe lose
+                    # the statically valid 16-byte alignment of this tile.
+                    gK = cute.make_tensor(
+                        cute.make_ptr(
+                            self._dtype,
+                            gK.iterator.llvm_ptr,
+                            gK.iterator.memspace,
+                            assumed_align=16,
+                        ),
+                        gK.layout,
+                    )
+                    tKgK = gmem_thr_copy.partition_S(gK)
+                    cute.copy(gmem_tiled_copy, tKgK, tKsK_gmem)
+                    cute.arch.cp_async_commit_group()
+                    cute.arch.cp_async_wait_group(0)
                 cute.arch.sync_threads()
 
                 acc_S = cute.make_rmem_tensor(acc_shape_S, cutlass.Float32)
@@ -286,12 +361,9 @@ class _MSASelectBlocksKernel:
                     row_is_valid = row_m < query_count
                     for cc in cutlass.range_constexpr(cute.size(acc_S_mn.shape[1])):
                         col_n = tScS_mn[rr, cc][1]
-                        k_pos = (
-                            key_block * Int32(BLOCK_SIZE)
-                            + Int32(key_slice * KEY_SLICE_SIZE)
-                            + col_n
-                        )
-                        if (not row_is_valid) or k_pos > q_pos:
+                        key_offset = Int32(key_slice * KEY_SLICE_SIZE) + col_n
+                        k_pos = key_start + key_offset
+                        if (not row_is_valid) or key_offset >= key_count or k_pos > q_pos:
                             acc_S_mn[rr, cc] = -cutlass.Float32.inf
 
                     row_scores = (acc_S_mn[rr, None].load() * softmax_scale).to(
@@ -312,12 +384,11 @@ class _MSASelectBlocksKernel:
                 q_pos = query_start + row_m
                 row_is_valid = row_m < query_count
                 score = block_max[rr]
-                local_block = q_pos // Int32(BLOCK_SIZE)
-                if row_is_valid and key_block == local_block:
+                if row_is_valid and key_unit == local_key_unit:
                     score = cutlass.Float32.inf
-                self._insert_topk(top_vals, top_idx, rr, score, key_block)
+                self._insert_topk(top_vals, top_idx, rr, score, key_unit)
 
-            key_block += Int32(1)
+            key_unit += Int32(1)
 
         for rr in cutlass.range_constexpr(num_acc_rows):
             row_m = tScS_mn[rr, 0][0]
@@ -386,7 +457,7 @@ class _MSASelectBlocksKernel:
                 top_idx[rr, slot] = insert_idx
                 if old_idx == insert_idx:
                     insert_val = -cutlass.Float32.inf
-                    insert_idx = Int32(self.num_blocks)
+                    insert_idx = Int32(self.num_key_units)
                 else:
                     insert_val = old_val
                     insert_idx = old_idx
@@ -443,6 +514,11 @@ def _compile_select_kernel(
     q_proxy: cute.Tensor,
     k_proxy: cute.Tensor,
     block_indices: cute.Tensor,
+    segment_starts: Optional[cute.Tensor],
+    segment_lengths: Optional[cute.Tensor],
+    segment_batches: Optional[cute.Tensor],
+    doc_first_segment: Optional[cute.Tensor],
+    num_segments: int | None,
     softmax_scale: float,
     stream: cuda.CUstream,
 ):
@@ -454,6 +530,7 @@ def _compile_select_kernel(
         int(seq_len),
         int(top_k_blocks),
         int(head_dim),
+        None if num_segments is None else int(num_segments),
         q_proxy.element_type,
         k_proxy.element_type,
         block_indices.element_type,
@@ -466,12 +543,17 @@ def _compile_select_kernel(
             seq_len=seq_len,
             top_k_blocks=top_k_blocks,
             head_dim=head_dim,
+            num_segments=num_segments,
         )
         _COMPILE_CACHE[key] = cute.compile(
             kernel,
             q_proxy,
             k_proxy,
             block_indices,
+            segment_starts,
+            segment_lengths,
+            segment_batches,
+            doc_first_segment,
             float(softmax_scale),
             stream,
         )
@@ -485,6 +567,7 @@ def select_blocks(
     scale: float,
     num_blocks: int,
     top_k_blocks: int,
+    document_segments: DocumentSegmentMetadata | None = None,
 ) -> torch.Tensor:
     """Select proxy blocks with a CuTeDSL MMA kernel."""
 
@@ -513,6 +596,19 @@ def select_blocks(
     q_t = _to_cute_tensor(q_c)
     k_t = _to_cute_tensor(k_c)
     block_indices_t = _to_cute_tensor(block_indices)
+    segment_starts_t = None
+    segment_lengths_t = None
+    segment_batches_t = None
+    doc_first_segment_t = None
+    num_segments = None
+    if document_segments is not None:
+        num_segments = document_segments.num_segments
+        segment_starts_t = _to_cute_tensor(document_segments.starts.contiguous())
+        segment_lengths_t = _to_cute_tensor(document_segments.lengths.contiguous())
+        segment_batches_t = _to_cute_tensor(document_segments.batches.contiguous())
+        doc_first_segment_t = _to_cute_tensor(
+            document_segments.doc_first_segment.contiguous()
+        )
     stream = cuda.CUstream(torch.cuda.current_stream(q_proxy.device).cuda_stream)
 
     compiled_select = _compile_select_kernel(
@@ -525,6 +621,11 @@ def select_blocks(
         q_t,
         k_t,
         block_indices_t,
+        segment_starts_t,
+        segment_lengths_t,
+        segment_batches_t,
+        doc_first_segment_t,
+        num_segments,
         float(scale),
         stream,
     )
@@ -532,6 +633,10 @@ def select_blocks(
         q_t,
         k_t,
         block_indices_t,
+        segment_starts_t,
+        segment_lengths_t,
+        segment_batches_t,
+        doc_first_segment_t,
         float(scale),
         stream,
     )

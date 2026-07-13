@@ -47,19 +47,23 @@ def _local_block_attention(
     v: torch.Tensor,
     *,
     scale: float,
+    cu_seqlens: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Run causal attention independently inside every local 128-token block."""
+    """Run causal attention independently inside each local block or segment."""
 
     batch, n_heads, seq_len, head_dim = map(int, q.shape)
     n_kv_heads = int(k.shape[1])
     value_dim = int(v.shape[-1])
     total_tokens = batch * seq_len
-    num_sequences = total_tokens // BLOCK_SIZE
-    cu_seqlens = torch.arange(
-        num_sequences + 1,
-        device=q.device,
-        dtype=torch.int32,
-    ) * BLOCK_SIZE
+    if cu_seqlens is None:
+        num_sequences = total_tokens // BLOCK_SIZE
+        cu_seqlens = torch.arange(
+            num_sequences + 1,
+            device=q.device,
+            dtype=torch.int32,
+        ) * BLOCK_SIZE
+    else:
+        cu_seqlens = cu_seqlens.to(device=q.device, dtype=torch.int32).contiguous()
 
     q_tokens = q.transpose(1, 2).contiguous().view(total_tokens, n_heads, head_dim)
     k_tokens = k.transpose(1, 2).contiguous().view(total_tokens, n_kv_heads, head_dim)
@@ -87,6 +91,49 @@ def _chunk_bounds(
     last = task_end - 1
     edge_end = int(meta[last, 4]) + int(meta[last, 3])
     return edge_start, edge_end
+
+
+def _remote_task_chunks(metadata: SparseAttentionMetadata):
+    """Yield bounded contiguous task runs with a shared KV access mode."""
+
+    if metadata.document_segments is None:
+        for task_start in range(
+            0, metadata.num_remote_tasks, TASKS_PER_FLASH_CHUNK
+        ):
+            yield (
+                task_start,
+                min(task_start + TASKS_PER_FLASH_CHUNK, metadata.num_remote_tasks),
+                True,
+            )
+        return
+
+    segments = metadata.document_segments
+    full_segments_cpu = segments.full_segments_cpu
+    if full_segments_cpu is None:
+        full_segments_cpu = (
+            (segments.starts.remainder(BLOCK_SIZE) == 0)
+            & (segments.lengths == BLOCK_SIZE)
+        ).cpu()
+        segments.full_segments_cpu = full_segments_cpu
+    task_segment_ids = metadata.remote_task_meta_cpu[
+        : metadata.num_remote_tasks, 2
+    ].long()
+    use_paged_by_task = full_segments_cpu[task_segment_ids].tolist()
+
+    task_start = 0
+    while task_start < metadata.num_remote_tasks:
+        use_paged = bool(use_paged_by_task[task_start])
+        task_end_limit = min(
+            task_start + TASKS_PER_FLASH_CHUNK, metadata.num_remote_tasks
+        )
+        task_end = task_start + 1
+        while (
+            task_end < task_end_limit
+            and bool(use_paged_by_task[task_end]) == use_paged
+        ):
+            task_end += 1
+        yield task_start, task_end, use_paged
+        task_start = task_end
 
 
 def sparse_flash_varlen_forward(
@@ -137,7 +184,15 @@ def sparse_flash_varlen_forward(
             dtype=v.dtype,
         )
     local_out, local_lse_hs = _local_block_attention(
-        q, k, attention_v, scale=float(scale)
+        q,
+        k,
+        attention_v,
+        scale=float(scale),
+        cu_seqlens=(
+            None
+            if metadata.document_segments is None
+            else metadata.document_segments.cu_seqlens
+        ),
     )
     lse_accum = (
         local_lse_hs.transpose(0, 1)
@@ -166,8 +221,7 @@ def sparse_flash_varlen_forward(
     k_pages = k.view(-1, BLOCK_SIZE, 1, head_dim)
     v_pages = attention_v.view(-1, BLOCK_SIZE, 1, value_dim)
 
-    for task_start in range(0, metadata.num_remote_tasks, TASKS_PER_FLASH_CHUNK):
-        task_end = min(task_start + TASKS_PER_FLASH_CHUNK, metadata.num_remote_tasks)
+    for task_start, task_end, use_paged_kv in _remote_task_chunks(metadata):
         edge_start, edge_end = _chunk_bounds(metadata, task_start, task_end)
         edge_count = edge_end - edge_start
         if edge_count == 0:
@@ -189,31 +243,83 @@ def sparse_flash_varlen_forward(
 
         task_batch = task_meta[:, 0].long()
         task_proxy = task_meta[:, 1].long()
-        task_block = task_meta[:, 2].long()
-        physical_page = (
-            (task_batch * n_kv_heads + proxy_to_kv[task_proxy]) * num_blocks
-            + task_block
-        ).to(torch.int32).view(-1, 1)
-        paged_result = flash_attn_varlen_paged_forward(
-            q=packed_q,
-            k_pages=k_pages,
-            v_pages=v_pages,
-            cu_seqlens_q=cu_seqlens_q,
-            page_table=physical_page,
-            max_seqlen_q=metadata.remote_query_chunk,
-            max_seqlen_k=BLOCK_SIZE,
-            softmax_scale=float(scale),
-            causal=False,
-        )
-        if paged_result is None:
-            packed_k = k_pages[physical_page[:, 0].long()].reshape(-1, 1, head_dim)
-            packed_v = v_pages[physical_page[:, 0].long()].reshape(-1, 1, value_dim)
-            cu_seqlens_k = torch.arange(
-                task_end - task_start + 1,
-                device=q.device,
-                dtype=torch.int32,
-            ) * BLOCK_SIZE
-            paged_result = flash_attn_varlen_forward(
+        task_key_unit = task_meta[:, 2].long()
+        if use_paged_kv:
+            if metadata.document_segments is None:
+                task_block = task_key_unit
+            else:
+                task_block = (
+                    metadata.document_segments.starts[task_key_unit].long()
+                    // BLOCK_SIZE
+                )
+            physical_page = (
+                (task_batch * n_kv_heads + proxy_to_kv[task_proxy]) * num_blocks
+                + task_block
+            ).to(torch.int32).view(-1, 1)
+            remote_result = flash_attn_varlen_paged_forward(
+                q=packed_q,
+                k_pages=k_pages,
+                v_pages=v_pages,
+                cu_seqlens_q=cu_seqlens_q,
+                page_table=physical_page,
+                max_seqlen_q=metadata.remote_query_chunk,
+                max_seqlen_k=BLOCK_SIZE,
+                softmax_scale=float(scale),
+                causal=False,
+            )
+            if remote_result is None:
+                packed_k = k_pages[physical_page[:, 0].long()].reshape(
+                    -1, 1, head_dim
+                )
+                packed_v = v_pages[physical_page[:, 0].long()].reshape(
+                    -1, 1, value_dim
+                )
+                cu_seqlens_k = torch.arange(
+                    task_end - task_start + 1,
+                    device=q.device,
+                    dtype=torch.int32,
+                ) * BLOCK_SIZE
+                remote_result = flash_attn_varlen_forward(
+                    q=packed_q,
+                    k=packed_k,
+                    v=packed_v,
+                    cu_seqlens_q=cu_seqlens_q,
+                    cu_seqlens_k=cu_seqlens_k,
+                    max_seqlen_q=metadata.remote_query_chunk,
+                    max_seqlen_k=BLOCK_SIZE,
+                    softmax_scale=float(scale),
+                    causal=False,
+                )
+        else:
+            assert metadata.document_segments is not None
+            segments = metadata.document_segments
+            task_lengths = segments.lengths[task_key_unit].to(torch.int32)
+            cu_seqlens_k = torch.cat(
+                (
+                    torch.zeros(1, device=q.device, dtype=torch.int32),
+                    task_lengths.cumsum(dim=0, dtype=torch.int32),
+                )
+            )
+            token_offsets = torch.arange(BLOCK_SIZE, device=q.device)
+            valid_tokens = token_offsets.unsqueeze(0) < task_lengths.long().unsqueeze(1)
+            token_positions = (
+                segments.starts[task_key_unit].long().unsqueeze(1)
+                + token_offsets.unsqueeze(0)
+            ).clamp_max(seq_len - 1)
+            task_kv_head = proxy_to_kv[task_proxy]
+            padded_k = k[
+                task_batch.unsqueeze(1),
+                task_kv_head.unsqueeze(1),
+                token_positions,
+            ]
+            padded_v = attention_v[
+                task_batch.unsqueeze(1),
+                task_kv_head.unsqueeze(1),
+                token_positions,
+            ]
+            packed_k = padded_k[valid_tokens].unsqueeze(1).contiguous()
+            packed_v = padded_v[valid_tokens].unsqueeze(1).contiguous()
+            remote_result = flash_attn_varlen_forward(
                 q=packed_q,
                 k=packed_k,
                 v=packed_v,
@@ -224,7 +330,7 @@ def sparse_flash_varlen_forward(
                 softmax_scale=float(scale),
                 causal=False,
             )
-        remote_out, remote_lse_hs = paged_result
+        remote_out, remote_lse_hs = remote_result
         remote_lse = remote_lse_hs.transpose(0, 1).contiguous()
         if output_accum is None:
             merge_lse_chunk_cuda(

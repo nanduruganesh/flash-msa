@@ -2,6 +2,11 @@
 
 import torch
 
+from flash_msa.reverse_index_cuda import (
+    DocumentSegmentMetadata,
+    build_document_segment_metadata_from_cu_seqlens,
+)
+
 
 def _validate_inputs(
     q_proxy: torch.Tensor,
@@ -54,6 +59,7 @@ class _WarmupSparseAttentionFunction(torch.autograd.Function):
         v: torch.Tensor,
         top_k: int,
         scale: float,
+        cu_seqlens: torch.Tensor | None,
     ):
         _ = int(top_k)
         _validate_inputs(q_proxy, k_proxy, q, k, v)
@@ -62,16 +68,75 @@ class _WarmupSparseAttentionFunction(torch.autograd.Function):
 
         from flash_msa.warmup.msa_forward_cutedsl_warmup import run_main_forward
 
-        o_main, lse_main, kl_loss = run_main_forward(q, k, v, scale=float(scale))
+        document_segments = None
+        if cu_seqlens is not None:
+            if cu_seqlens.device != q.device:
+                raise ValueError(
+                    "cu_seqlens must be on the same device as attention inputs"
+                )
+            document_segments = build_document_segment_metadata_from_cu_seqlens(
+                cu_seqlens,
+                batch_size=q.shape[0],
+                seq_len=q.shape[2],
+            )
+
+        o_main, lse_main, kl_loss = run_main_forward(
+            q,
+            k,
+            v,
+            scale=float(scale),
+            cu_seqlens=cu_seqlens,
+        )
         out = o_main.transpose(1, 2).reshape(q.shape[0], q.shape[2], -1)
 
-        ctx.save_for_backward(q_proxy, k_proxy, q, k, v, lse_main, o_main)
+        save_tensors: tuple[torch.Tensor, ...] = (
+            q_proxy,
+            k_proxy,
+            q,
+            k,
+            v,
+            lse_main,
+            o_main,
+        )
+        if document_segments is not None:
+            assert cu_seqlens is not None
+            save_tensors += (
+                cu_seqlens,
+                document_segments.starts,
+                document_segments.lengths,
+                document_segments.batches,
+                document_segments.doc_first_segment,
+                document_segments.token_segment_ids,
+                document_segments.cu_seqlens,
+            )
+        ctx.save_for_backward(*save_tensors)
+        ctx.has_document_segments = document_segments is not None
         ctx.scale = float(scale)
         return out, kl_loss
 
     @staticmethod
     def backward(ctx, grad_out: torch.Tensor | None, grad_kl: torch.Tensor | None):
-        q_proxy, k_proxy, q, k, v, lse_main, o_main = ctx.saved_tensors
+        q_proxy, k_proxy, q, k, v, lse_main, o_main = ctx.saved_tensors[:7]
+        cu_seqlens = None
+        document_segments = None
+        if ctx.has_document_segments:
+            (
+                cu_seqlens,
+                segment_starts,
+                segment_lengths,
+                segment_batches,
+                doc_first_segment,
+                token_segment_ids,
+                segment_cu_seqlens,
+            ) = ctx.saved_tensors[7:]
+            document_segments = DocumentSegmentMetadata(
+                starts=segment_starts,
+                lengths=segment_lengths,
+                batches=segment_batches,
+                doc_first_segment=doc_first_segment,
+                token_segment_ids=token_segment_ids,
+                cu_seqlens=segment_cu_seqlens,
+            )
 
         from flash_msa.warmup.msa_backward_cutedsl_warmup import run_warmup_backward
 
@@ -86,8 +151,10 @@ class _WarmupSparseAttentionFunction(torch.autograd.Function):
             grad_out,
             grad_kl,
             scale=ctx.scale,
+            cu_seqlens=cu_seqlens,
+            document_segments=document_segments,
         )
-        return dq_proxy, dk_proxy, dq, dk, dv, None, None
+        return dq_proxy, dk_proxy, dq, dk, dv, None, None, None
 
 
 def sparse_attention_warmup(
@@ -98,9 +165,23 @@ def sparse_attention_warmup(
     v: torch.Tensor,
     top_k: int,
     scale: float,
+    *,
+    cu_seqlens: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Compute dense causal warmup attention and proxy KL gradients."""
+    """Compute dense causal warmup attention and proxy KL gradients.
+
+    ``cu_seqlens`` follows FA4's CUDA int32 cumulative-offset convention over
+    flattened ``B * S`` tokens. The offsets must include every batch-row
+    boundary. Callers remain responsible for resetting RoPE per document.
+    """
 
     return _WarmupSparseAttentionFunction.apply(
-        q_proxy, k_proxy, q, k, v, int(top_k), float(scale)
+        q_proxy,
+        k_proxy,
+        q,
+        k,
+        v,
+        int(top_k),
+        float(scale),
+        cu_seqlens,
     )

@@ -9,6 +9,7 @@ The fused MMA kernel recomputes per-tile probabilities, forms main/proxy
 
 import inspect
 import os
+from typing import Optional
 
 import cutlass
 import torch
@@ -18,6 +19,8 @@ from cutlass._mlir.dialects import nvvm
 from cutlass.cute.nvgpu import warp
 from cutlass.cute.runtime import from_dlpack
 from cutlass.cutlass_dsl import T, dsl_user_op
+
+from flash_msa.reverse_index_cuda import DocumentSegmentMetadata
 
 BLOCK_SIZE = 128
 KEY_SLICE_SIZE = 64
@@ -117,6 +120,7 @@ class _MSAFusedBackwardMMAKernel:
         head_dim: int,
         num_tasks: int,
         input_query_chunk: int,
+        use_document_segments: bool = False,
         num_threads: int = 256,
     ) -> None:
         if head_dim != 128:
@@ -134,6 +138,7 @@ class _MSAFusedBackwardMMAKernel:
         self.proxy_heads_per_kv = int(n_proxy_heads) // int(n_kv_heads)
         self.proxy_groups = int(n_proxy_heads) // int(n_proxy_kv_heads)
         self.input_query_chunk = int(input_query_chunk)
+        self.use_document_segments = bool(use_document_segments)
         if self.input_query_chunk % query_chunk != 0:
             raise NotImplementedError(
                 "fused backward input task query width must be divisible by "
@@ -157,6 +162,8 @@ class _MSAFusedBackwardMMAKernel:
         delta_main: cute.Tensor,
         task_meta: cute.Tensor,
         task_qids: cute.Tensor,
+        segment_starts: Optional[cute.Tensor],
+        segment_lengths: Optional[cute.Tensor],
         dq_proxy: cute.Tensor,
         dk_proxy: cute.Tensor,
         dq: cute.Tensor,
@@ -260,6 +267,8 @@ class _MSAFusedBackwardMMAKernel:
             delta_main,
             task_meta,
             task_qids,
+            segment_starts,
+            segment_lengths,
             dq_proxy,
             dk_proxy,
             dq,
@@ -295,6 +304,8 @@ class _MSAFusedBackwardMMAKernel:
         delta_main: cute.Tensor,
         task_meta: cute.Tensor,
         task_qids: cute.Tensor,
+        segment_starts: Optional[cute.Tensor],
+        segment_lengths: Optional[cute.Tensor],
         dq_proxy: cute.Tensor,
         dk_proxy: cute.Tensor,
         dq: cute.Tensor,
@@ -324,6 +335,11 @@ class _MSAFusedBackwardMMAKernel:
         batch = task_meta[task_idx, 0]
         proxy_head = task_meta[task_idx, 1]
         key_block = task_meta[task_idx, 2]
+        key_start = key_block * Int32(BLOCK_SIZE)
+        key_count = Int32(BLOCK_SIZE)
+        if cutlass.const_expr(self.use_document_segments):
+            key_start = segment_starts[key_block]
+            key_count = segment_lengths[key_block]
         query_count = cutlass.min(Int32(self.query_chunk), task_meta[task_idx, 3] - qid_base)
         kv_head = proxy_head // Int32(self.proxy_heads_per_kv)
         proxy_kv_head = proxy_head // Int32(self.proxy_groups)
@@ -417,9 +433,14 @@ class _MSAFusedBackwardMMAKernel:
             while kv_linear < Int32(KEY_SLICE_SIZE * self.head_dim):
                 row = kv_linear // Int32(self.head_dim)
                 dim = kv_linear - row * Int32(self.head_dim)
-                key_pos = key_block * Int32(BLOCK_SIZE) + Int32(key_slice * KEY_SLICE_SIZE) + row
-                sK[row, dim] = k[batch, kv_head, key_pos, dim]
-                sV[row, dim] = v[batch, kv_head, key_pos, dim]
+                key_offset = Int32(key_slice * KEY_SLICE_SIZE) + row
+                if key_offset < key_count:
+                    key_pos = key_start + key_offset
+                    sK[row, dim] = k[batch, kv_head, key_pos, dim]
+                    sV[row, dim] = v[batch, kv_head, key_pos, dim]
+                else:
+                    sK[row, dim] = zero
+                    sV[row, dim] = zero
                 kv_linear += Int32(self.num_threads)
 
             if grad_kl_scale != Float32(0.0):
@@ -427,10 +448,12 @@ class _MSAFusedBackwardMMAKernel:
                 while px_k_linear < Int32(KEY_SLICE_SIZE * self.head_dim):
                     row = px_k_linear // Int32(self.head_dim)
                     dim = px_k_linear - row * Int32(self.head_dim)
-                    key_pos = (
-                        key_block * Int32(BLOCK_SIZE) + Int32(key_slice * KEY_SLICE_SIZE) + row
-                    )
-                    sKpx[row, dim] = k_proxy[batch, proxy_kv_head, key_pos, dim]
+                    key_offset = Int32(key_slice * KEY_SLICE_SIZE) + row
+                    if key_offset < key_count:
+                        key_pos = key_start + key_offset
+                        sKpx[row, dim] = k_proxy[batch, proxy_kv_head, key_pos, dim]
+                    else:
+                        sKpx[row, dim] = zero
                     px_k_linear += Int32(self.num_threads)
 
             cute.arch.sync_threads()
@@ -488,11 +511,10 @@ class _MSAFusedBackwardMMAKernel:
 
                 for cc in cutlass.range_constexpr(cute.size(acc_S_mn.shape[1])):
                     col_n = tScS_mn[rr, cc][1]
-                    key_pos = (
-                        key_block * Int32(BLOCK_SIZE) + Int32(key_slice * KEY_SLICE_SIZE) + col_n
-                    )
+                    key_offset = Int32(key_slice * KEY_SLICE_SIZE) + col_n
+                    key_pos = key_start + key_offset
                     p = Float32(0.0)
-                    if row_is_valid and key_pos <= q_pos:
+                    if row_is_valid and key_offset < key_count and key_pos <= q_pos:
                         p = cute.math.exp2(
                             acc_S_mn[rr, cc] * softmax_scale_log2 - lse * log2_e, fastmath=True
                         )
@@ -523,7 +545,8 @@ class _MSAFusedBackwardMMAKernel:
                 tKVcKV_mn,
                 batch,
                 kv_head,
-                key_block,
+                key_start,
+                key_count,
                 Int32(key_slice),
                 dv,
                 softmax_scale,
@@ -543,7 +566,8 @@ class _MSAFusedBackwardMMAKernel:
                 tKVcKV_mn,
                 batch,
                 kv_head,
-                key_block,
+                key_start,
+                key_count,
                 Int32(key_slice),
                 dk,
                 softmax_scale,
@@ -648,14 +672,11 @@ class _MSAFusedBackwardMMAKernel:
                         lse_px = lse_proxy[batch, proxy_head, q_pos]
                     for cc in cutlass.range_constexpr(cute.size(acc_Px_mn.shape[1])):
                         col_n = tPxcS_mn[rr, cc][1]
-                        key_pos = (
-                            key_block * Int32(BLOCK_SIZE)
-                            + Int32(key_slice * KEY_SLICE_SIZE)
-                            + col_n
-                        )
+                        key_offset = Int32(key_slice * KEY_SLICE_SIZE) + col_n
+                        key_pos = key_start + key_offset
                         # HERE IS THE KL LOSS SURROGATE
                         ds_px = Float32(0.0)
-                        if row_is_valid and key_pos <= q_pos:
+                        if row_is_valid and key_offset < key_count and key_pos <= q_pos:
                             p_px = cute.math.exp2(
                                 acc_Px_mn[rr, cc] * softmax_scale_log2 - lse_px * log2_e,
                                 fastmath=True,
@@ -726,7 +747,8 @@ class _MSAFusedBackwardMMAKernel:
                     tPxcDK_mn,
                     batch,
                     proxy_kv_head,
-                    key_block,
+                    key_start,
+                    key_count,
                     Int32(key_slice),
                     dk_proxy,
                     softmax_scale,
@@ -769,7 +791,8 @@ class _MSAFusedBackwardMMAKernel:
         coord_mn: cute.Tensor,
         batch: Int32,
         kv_head: Int32,
-        key_block: Int32,
+        key_start: Int32,
+        key_count: Int32,
         key_slice: Int32,
         target: cute.Tensor,
         softmax_scale: cutlass.Float32,
@@ -778,13 +801,15 @@ class _MSAFusedBackwardMMAKernel:
         acc_mn = _make_acc_tensor_mn_view(acc)
         for rr in cutlass.range_constexpr(cute.size(acc_mn.shape[0])):
             key_row = coord_mn[rr, 0][0]
-            key_pos = key_block * Int32(BLOCK_SIZE) + key_slice * Int32(KEY_SLICE_SIZE) + key_row
-            for cc in cutlass.range_constexpr(cute.size(acc_mn.shape[1])):
-                dim = coord_mn[rr, cc][1]
-                value = acc_mn[rr, cc]
-                if cutlass.const_expr(apply_scale):
-                    value = value * softmax_scale
-                _atomic_add_fp32(value, _elem_pointer(target, (batch, kv_head, key_pos, dim)))
+            key_offset = key_slice * Int32(KEY_SLICE_SIZE) + key_row
+            if key_offset < key_count:
+                key_pos = key_start + key_offset
+                for cc in cutlass.range_constexpr(cute.size(acc_mn.shape[1])):
+                    dim = coord_mn[rr, cc][1]
+                    value = acc_mn[rr, cc]
+                    if cutlass.const_expr(apply_scale):
+                        value = value * softmax_scale
+                    _atomic_add_fp32(value, _elem_pointer(target, (batch, kv_head, key_pos, dim)))
 
     @cute.jit
     def _atomic_proxy_dq(
@@ -819,7 +844,8 @@ class _MSAFusedBackwardMMAKernel:
         coord_mn: cute.Tensor,
         batch: Int32,
         proxy_kv_head: Int32,
-        key_block: Int32,
+        key_start: Int32,
+        key_count: Int32,
         key_slice: Int32,
         dk_proxy: cute.Tensor,
         softmax_scale: cutlass.Float32,
@@ -827,13 +853,15 @@ class _MSAFusedBackwardMMAKernel:
         acc_mn = _make_acc_tensor_mn_view(acc_dk)
         for rr in cutlass.range_constexpr(cute.size(acc_mn.shape[0])):
             key_row = coord_mn[rr, 0][0]
-            key_pos = key_block * Int32(BLOCK_SIZE) + key_slice * Int32(KEY_SLICE_SIZE) + key_row
-            for cc in cutlass.range_constexpr(cute.size(acc_mn.shape[1])):
-                dim = coord_mn[rr, cc][1]
-                _atomic_add_fp32(
-                    acc_mn[rr, cc] * softmax_scale,
-                    _elem_pointer(dk_proxy, (batch, proxy_kv_head, key_pos, dim)),
-                )
+            key_offset = key_slice * Int32(KEY_SLICE_SIZE) + key_row
+            if key_offset < key_count:
+                key_pos = key_start + key_offset
+                for cc in cutlass.range_constexpr(cute.size(acc_mn.shape[1])):
+                    dim = coord_mn[rr, cc][1]
+                    _atomic_add_fp32(
+                        acc_mn[rr, cc] * softmax_scale,
+                        _elem_pointer(dk_proxy, (batch, proxy_kv_head, key_pos, dim)),
+                    )
 
 
 def _compile_fused_backward_kernel(
@@ -857,6 +885,9 @@ def _compile_fused_backward_kernel(
     delta_main: cute.Tensor,
     task_meta: cute.Tensor,
     task_qids: cute.Tensor,
+    segment_starts: Optional[cute.Tensor],
+    segment_lengths: Optional[cute.Tensor],
+    use_document_segments: bool,
     dq_proxy: cute.Tensor,
     dk_proxy: cute.Tensor,
     dq: cute.Tensor,
@@ -885,6 +916,7 @@ def _compile_fused_backward_kernel(
         int(head_dim),
         int(num_tasks),
         int(input_query_chunk),
+        bool(use_document_segments),
         int(num_threads),
         q_proxy.element_type,
         k_proxy.element_type,
@@ -914,6 +946,7 @@ def _compile_fused_backward_kernel(
             head_dim=head_dim,
             num_tasks=num_tasks,
             input_query_chunk=input_query_chunk,
+            use_document_segments=use_document_segments,
             num_threads=num_threads,
         )
         _COMPILE_CACHE[key] = cute.compile(
@@ -929,6 +962,8 @@ def _compile_fused_backward_kernel(
             delta_main,
             task_meta,
             task_qids,
+            segment_starts,
+            segment_lengths,
             dq_proxy,
             dk_proxy,
             dq,
@@ -957,6 +992,7 @@ def _run_fused_backward_impl(
     scale: float,
     grad_kl_scale: float,
     cast_outputs: bool = True,
+    document_segments: DocumentSegmentMetadata | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     if q.device.type != "cuda":
         raise ValueError("CuTeDSL fused backward requires CUDA tensors")
@@ -1010,6 +1046,11 @@ def _run_fused_backward_impl(
     delta_main_t = _to_cute_tensor(delta_main_c)
     task_meta_t = _to_cute_tensor(task_meta_c)
     task_qids_t = _to_cute_tensor(task_qids_c)
+    segment_starts_t = None
+    segment_lengths_t = None
+    if document_segments is not None:
+        segment_starts_t = _to_cute_tensor(document_segments.starts.contiguous())
+        segment_lengths_t = _to_cute_tensor(document_segments.lengths.contiguous())
     dq_proxy_t = _to_cute_tensor(dq_proxy)
     dk_proxy_t = _to_cute_tensor(dk_proxy)
     dq_t = _to_cute_tensor(dq)
@@ -1038,6 +1079,9 @@ def _run_fused_backward_impl(
         delta_main_t,
         task_meta_t,
         task_qids_t,
+        segment_starts_t,
+        segment_lengths_t,
+        document_segments is not None,
         dq_proxy_t,
         dk_proxy_t,
         dq_t,
@@ -1059,6 +1103,8 @@ def _run_fused_backward_impl(
         delta_main_t,
         task_meta_t,
         task_qids_t,
+        segment_starts_t,
+        segment_lengths_t,
         dq_proxy_t,
         dk_proxy_t,
         dq_t,
@@ -1095,6 +1141,7 @@ def run_fused_backward(
     *,
     scale: float,
     grad_kl_scale: float,
+    document_segments: DocumentSegmentMetadata | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
 
     return _run_fused_backward_impl(
@@ -1111,4 +1158,5 @@ def run_fused_backward(
         task_qids,
         scale=scale,
         grad_kl_scale=grad_kl_scale,
+        document_segments=document_segments,
     )
