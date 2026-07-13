@@ -38,7 +38,7 @@ attn_out, kl_loss = flash_msa_func(Q_proxy, K_proxy, Q, K, V, top_k, head_dim **
 ```
 or
 ```
-from flash_msa import flash_msa_warmup
+from flash_msa import flash_msa_warmup_func
 attn_out, kl_loss = flash_msa_warmup_func(Q_proxy, K_proxy, Q, K, V, top_k, head_dim ** -0.5)
 ```
 
@@ -50,7 +50,7 @@ Note that kl_loss in the forward is just a torch.zeros placeholder, but after ad
 2. Flash-MSA does not currently return fully materialized KL div. loss term in the fwd/bwd (see [blog](https://nanduruganesh.github.io/flash-msa) for explanation).
 3. No support for quantized training (fp8, nvfp4, mxfp4).
 4. No support for attn temps / oai-style softmax bias.
-5. Proxy Q is grouped by Main KV so Q_p <= KV heads for now.
+5. Proxy Q is grouped by Main KV so Q_p >= KV heads for now.
 
 These are not ridiculous to implement though so if there is demand or if someone makes a PR, I will update the repo to include these features.
 
