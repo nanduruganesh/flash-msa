@@ -46,11 +46,12 @@ Note that kl_loss in the forward is just a torch.zeros placeholder, but after ad
 
 # Caveats
 
-1. Flash-MSA only supports headdims 128, block size 128.
-2. Flash-MSA does not currently return fully materialized KL div. loss term in the fwd/bwd (see [blog](https://nanduruganesh.github.io/flash-msa) for explanation).
-3. No support for quantized training (fp8, nvfp4, mxfp4).
-4. No support for attn temps / oai-style softmax bias.
-5. Proxy Q is grouped by Main KV so Q_p >= KV heads for now.
+1. No varlen/doc-masking support yet (highest priority)
+2. Flash-MSA only supports headdims 128, block size 128.
+3. Flash-MSA does not currently return fully materialized KL div. loss term in the fwd/bwd (see [blog](https://nanduruganesh.github.io/flash-msa) for explanation).
+4. No support for quantized training (fp8, nvfp4, mxfp4).
+5. No support for attn temps / oai-style softmax bias.
+6. Proxy Q is grouped by Main KV so Q_p >= KV heads for now.
 
 These are not ridiculous to implement though so if there is demand or if someone makes a PR, I will update the repo to include these features.
 
